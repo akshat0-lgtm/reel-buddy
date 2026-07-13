@@ -6,8 +6,8 @@ fastest way to get the account flagged. Generate session.json locally with
 setup_session.py, then ship it as the IG_SESSION_B64 env var.
 """
 import base64
-import json
 import logging
+import re
 import tempfile
 import time
 from pathlib import Path
@@ -99,25 +99,12 @@ def download_video(url: str) -> Path:
     return tmp
 
 
-def extract_reel(msg):
-    """
-    If this DM message is a shared reel/video post, return a dict with its details.
-    Otherwise return None.
+SHORTCODE_RE = re.compile(r"instagram\.com/(?:reel|reels|p|tv)/([A-Za-z0-9_-]+)")
 
-    Shared reels arrive as item_type == "clip" (msg.clip is a Media object).
-    Shared feed posts arrive as item_type == "media_share".
-    """
-    media = None
-    if msg.item_type == "clip" and msg.clip:
-        media = msg.clip
-    elif msg.item_type == "media_share" and msg.media_share:
-        media = msg.media_share
 
-    if media is None:
-        return None
+def _media_to_reel(media):
     if not getattr(media, "video_url", None):
         return None  # image post — nothing to transcribe (v1 skips these)
-
     return {
         "media_pk": str(media.pk),
         "code": media.code or "",
@@ -125,3 +112,43 @@ def extract_reel(msg):
         "video_url": str(media.video_url),
         "author": getattr(media.user, "username", "") if media.user else "",
     }
+
+
+def extract_reel(cl: Client, msg):
+    """
+    If this DM message is a shared reel/video post, return a dict of its details.
+    Otherwise return None.
+
+    Instagram has several share formats and which one you get depends on the app
+    version doing the sharing:
+      - "clip"        -> msg.clip is a full Media object (caption, CDN url, pk)
+      - "media_share" -> msg.media_share, same deal
+      - "xma_share"   -> msg.xma_share is a MediaXma: it has NO caption/pk/code,
+                         only a URL which is usually the PERMALINK. So we pull the
+                         shortcode out of it and fetch the real media ourselves.
+    """
+    # 1) The easy formats: a full Media object is already attached
+    for attr in ("clip", "media_share"):
+        media = getattr(msg, attr, None)
+        if media:
+            return _media_to_reel(media)
+
+    # 2) The XMA format: resolve permalink -> shortcode -> real Media
+    xma = getattr(msg, "xma_share", None)
+    if xma:
+        for url in (getattr(xma, "video_url", None), getattr(xma, "preview_url", None)):
+            if not url:
+                continue
+            m = SHORTCODE_RE.search(str(url))
+            if m:
+                code = m.group(1)
+                log.info("XMA share -> resolving shortcode %s", code)
+                media = cl.media_info(cl.media_pk_from_code(code))
+                return _media_to_reel(media)
+        log.warning("xma_share had no resolvable instagram URL: %s", xma)
+        return None
+
+    # 3) Not a share we handle — log the type so unknown formats are visible
+    if msg.item_type not in ("text", "like", "action_log", "placeholder"):
+        log.warning("Unhandled item_type=%r (no reel extracted)", msg.item_type)
+    return None
