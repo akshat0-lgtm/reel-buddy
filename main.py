@@ -59,7 +59,12 @@ _ig_lock = threading.Lock()
 
 
 def _reply(cl, thread_id: str, text: str):
-    """Serialized Instagram reply. Use this instead of ig.reply() directly."""
+    """Serialized Instagram reply with anti-automation jitter. Use instead of ig.reply()."""
+    # Variable pause before sending: a fixed reply delay across many threads is a
+    # stronger automation signal to Instagram than the poll timing (Task 1). Done
+    # before acquiring the lock so the waits overlap across workers rather than
+    # stacking; only the actual send is serialized.
+    time.sleep(random.uniform(1, 4))
     with _ig_lock:
         ig.reply(cl, thread_id, text)
 
