@@ -25,5 +25,9 @@ SUPABASE_KEY = os.environ["SUPABASE_KEY"]  # service_role key
 # --- Behaviour ---
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "30"))
 TOP_K = int(os.environ.get("TOP_K", "5"))            # reels retrieved per question
+# Max messages processed in parallel within one poll cycle (Task 0). Bounded on
+# purpose: uncapped concurrency would just move the bottleneck to Groq rate limits.
+# The Instagram API calls themselves stay serialized regardless (see main._ig_lock).
+MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "4"))
 EMBED_MODEL = "BAAI/bge-small-en-v1.5"                # 384-dim, small enough for free tiers
 PORT = int(os.environ.get("PORT", "10000"))           # health server (keeps Render awake)

@@ -14,6 +14,7 @@ import logging
 import random
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import config
@@ -48,6 +49,21 @@ def start_health_server():
 
 # ---------- message handlers ----------
 
+# All outbound Instagram API calls (replies + the media lookups inside
+# extract_reel) run under this lock. Task 0 parallelises the slow per-message
+# pipeline (download, ffmpeg, whisper, extraction, embed, insert), but the
+# account's IG calls stay single-threaded and human-paced on purpose: concurrent
+# IG calls raise ban risk (HANDOVER §4f) and instagrapi's shared Client is not
+# guaranteed thread-safe.
+_ig_lock = threading.Lock()
+
+
+def _reply(cl, thread_id: str, text: str):
+    """Serialized Instagram reply. Use this instead of ig.reply() directly."""
+    with _ig_lock:
+        ig.reply(cl, thread_id, text)
+
+
 # lowercase, warm-but-dry confirmations — no emoji, no templated "Saved". see Task A.
 _CONFIRMATIONS = [
     "got it",
@@ -61,7 +77,7 @@ _CONFIRMATIONS = [
 
 def handle_reel(cl, thread_id: str, reel: dict, owner_id: str):
     if rag.reel_exists(reel["media_pk"], owner_id):
-        ig.reply(cl, thread_id, "ha, you already sent me this one")
+        _reply(cl, thread_id, "ha, you already sent me this one")
         return
 
     video_path = ig.download_video(reel["video_url"])
@@ -75,14 +91,14 @@ def handle_reel(cl, thread_id: str, reel: dict, owner_id: str):
 
     ack = random.choice(_CONFIRMATIONS)
     if transcript:
-        ig.reply(cl, thread_id, ack)
+        _reply(cl, thread_id, ack)
     else:
-        ig.reply(cl, thread_id, f"{ack} (no audio on that one, so i went off the caption)")
+        _reply(cl, thread_id, f"{ack} (no audio on that one, so i went off the caption)")
 
 
 def handle_text(cl, thread_id: str, text: str, owner_id: str):
     answer = rag.answer_question(text, owner_id)
-    ig.reply(cl, thread_id, answer)
+    _reply(cl, thread_id, answer)
 
 
 def process_message(cl, thread_id: str, msg, own_id: int):
@@ -102,7 +118,9 @@ def process_message(cl, thread_id: str, msg, own_id: int):
     owner_id = str(msg.user_id)
 
     try:
-        reel = ig.extract_reel(cl, msg)
+        # extract_reel may hit the IG API (media_info for xma shares), so serialize it
+        with _ig_lock:
+            reel = ig.extract_reel(cl, msg)
         if reel:
             log.info("Ingesting reel %s for owner %s", reel["code"], owner_id)
             handle_reel(cl, thread_id, reel, owner_id)
@@ -113,7 +131,7 @@ def process_message(cl, thread_id: str, msg, own_id: int):
     except Exception as e:
         log.exception("Failed on message %s", msg.id)
         try:
-            ig.reply(cl, thread_id, "ugh, that one broke on me. mind resending?")
+            _reply(cl, thread_id, "ugh, that one broke on me. mind resending?")
         except Exception:
             pass
 
@@ -133,9 +151,27 @@ def main():
 
     consecutive_errors = 0
     while True:
+        cycle_start = time.monotonic()
         try:
-            for thread_id, msg in ig.fetch_recent_messages(cl):
-                process_message(cl, thread_id, msg, own_id)
+            # Gather the whole cycle first, then fan out to a bounded worker pool.
+            # The `with` block only exits once every message is fully drained, so
+            # cycles never overlap and the next poll waits for this one to finish.
+            messages = list(ig.fetch_recent_messages(cl))
+            if messages:
+                log.info("Poll cycle: %d message(s) picked up", len(messages))
+                with ThreadPoolExecutor(max_workers=config.MAX_CONCURRENCY) as pool:
+                    futures = [
+                        pool.submit(process_message, cl, thread_id, msg, own_id)
+                        for thread_id, msg in messages
+                    ]
+                    for f in as_completed(futures):
+                        exc = f.exception()  # process_message swallows its own; guard anyway
+                        if exc:
+                            log.error("Worker crashed unexpectedly: %s", exc)
+                log.info(
+                    "Poll cycle: drained %d message(s) in %.1fs",
+                    len(messages), time.monotonic() - cycle_start,
+                )
             consecutive_errors = 0
         except Exception as e:
             consecutive_errors += 1

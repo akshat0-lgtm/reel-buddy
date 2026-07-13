@@ -16,7 +16,9 @@ import config
 log = logging.getLogger("reelbuddy.rag")
 
 sb = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
-groq_client = Groq(api_key=config.GROQ_API_KEY)
+# max_retries: SDK-native exponential backoff on 429/5xx, honoring Retry-After.
+# Bumped from the default 2 so a rate-limit spike retries instead of failing a query.
+groq_client = Groq(api_key=config.GROQ_API_KEY, max_retries=5)
 
 log.info("Loading embedding model (first run downloads ~130MB)...")
 _embedder = TextEmbedding(config.EMBED_MODEL)
