@@ -16,6 +16,11 @@ import requests
 from instagrapi import Client
 
 import config
+import xma_patch
+
+# Must run before any Client is created: teaches instagrapi to parse the
+# `xma_clip` share format that the current Instagram app actually sends.
+xma_patch.apply()
 
 log = logging.getLogger("reelbuddy.ig")
 
@@ -123,9 +128,11 @@ def extract_reel(cl: Client, msg):
     version doing the sharing:
       - "clip"        -> msg.clip is a full Media object (caption, CDN url, pk)
       - "media_share" -> msg.media_share, same deal
-      - "xma_share"   -> msg.xma_share is a MediaXma: it has NO caption/pk/code,
-                         only a URL which is usually the PERMALINK. So we pull the
-                         shortcode out of it and fetch the real media ourselves.
+      - "xma_clip"    -> what the CURRENT app sends. instagrapi doesn't parse this
+                         at all, so xma_patch.py normalises it into xma_share.
+      - "xma_share"   -> a MediaXma: it has NO caption/pk/code, only a URL which is
+                         the PERMALINK. So we pull the shortcode out of it and fetch
+                         the real media (caption + CDN video url) ourselves.
     """
     # 1) The easy formats: a full Media object is already attached
     for attr in ("clip", "media_share"):
