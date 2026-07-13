@@ -48,9 +48,13 @@ def start_health_server():
 
 # ---------- message handlers ----------
 
+# lowercase, dry confirmations — no emoji, no templated "Saved". see Task A.
+_CONFIRMATIONS = ["got it", "noted", "saved that one", "cool, saved", "on it, saved"]
+
+
 def handle_reel(cl, thread_id: str, reel: dict):
     if rag.reel_exists(reel["media_pk"]):
-        ig.reply(cl, thread_id, "Already got this one saved 👍")
+        ig.reply(cl, thread_id, "already got that one saved")
         return
 
     video_path = ig.download_video(reel["video_url"])
@@ -59,13 +63,14 @@ def handle_reel(cl, thread_id: str, reel: dict):
     finally:
         video_path.unlink(missing_ok=True)
 
-    rag.save_reel(reel, transcript)
+    meta = ingest.extract_metadata(reel["caption"], transcript)
+    rag.save_reel(reel, transcript, meta)
 
-    label = reel["caption"][:60].replace("\n", " ") or f"reel by @{reel['author']}"
+    ack = random.choice(_CONFIRMATIONS)
     if transcript:
-        ig.reply(cl, thread_id, f"Saved ✅ \"{label}...\" — ask me about it anytime.")
+        ig.reply(cl, thread_id, ack)
     else:
-        ig.reply(cl, thread_id, f"Saved ✅ \"{label}...\" (no speech detected, indexed the caption).")
+        ig.reply(cl, thread_id, f"{ack} — no speech on it, saved the caption.")
 
 
 def handle_text(cl, thread_id: str, text: str):
@@ -97,7 +102,7 @@ def process_message(cl, thread_id: str, msg, own_id: int, allowed_ids: set):
     except Exception as e:
         log.exception("Failed on message %s", msg.id)
         try:
-            ig.reply(cl, thread_id, "Hit an error on that one 😬 try again?")
+            ig.reply(cl, thread_id, "hit a snag on that one, try again?")
         except Exception:
             pass
 
