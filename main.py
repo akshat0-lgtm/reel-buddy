@@ -86,7 +86,7 @@ def process_message(cl, thread_id: str, msg, own_id: int, allowed_ids: set):
     rag.mark_processed(msg.id)
 
     try:
-        reel = ig.extract_reel(msg)
+        reel = ig.extract_reel(cl, msg)
         if reel:
             log.info("Ingesting reel %s", reel["code"])
             handle_reel(cl, thread_id, reel)
