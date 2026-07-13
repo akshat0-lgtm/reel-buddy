@@ -48,13 +48,20 @@ def start_health_server():
 
 # ---------- message handlers ----------
 
-# lowercase, dry confirmations — no emoji, no templated "Saved". see Task A.
-_CONFIRMATIONS = ["got it", "noted", "saved that one", "cool, saved", "on it, saved"]
+# lowercase, warm-but-dry confirmations — no emoji, no templated "Saved". see Task A.
+_CONFIRMATIONS = [
+    "got it",
+    "nice, that's in",
+    "ooh good one, saved",
+    "noted",
+    "saved — solid pick",
+    "cool, tucked that away",
+]
 
 
 def handle_reel(cl, thread_id: str, reel: dict, owner_id: str):
     if rag.reel_exists(reel["media_pk"], owner_id):
-        ig.reply(cl, thread_id, "already got that one saved")
+        ig.reply(cl, thread_id, "ha, you already sent me this one")
         return
 
     video_path = ig.download_video(reel["video_url"])
@@ -70,7 +77,7 @@ def handle_reel(cl, thread_id: str, reel: dict, owner_id: str):
     if transcript:
         ig.reply(cl, thread_id, ack)
     else:
-        ig.reply(cl, thread_id, f"{ack} — no speech on it, saved the caption.")
+        ig.reply(cl, thread_id, f"{ack} (no audio on that one, so i went off the caption)")
 
 
 def handle_text(cl, thread_id: str, text: str, owner_id: str):
@@ -106,7 +113,7 @@ def process_message(cl, thread_id: str, msg, own_id: int):
     except Exception as e:
         log.exception("Failed on message %s", msg.id)
         try:
-            ig.reply(cl, thread_id, "hit a snag on that one, try again?")
+            ig.reply(cl, thread_id, "ugh, that one broke on me. mind resending?")
         except Exception:
             pass
 

@@ -19,20 +19,20 @@ log = logging.getLogger("reelbuddy.ingest")
 
 groq_client = Groq(api_key=config.GROQ_API_KEY)
 
-CATEGORY_ENUM = {"food", "travel", "hobby", "fitness", "shopping", "culture", "misc"}
+CATEGORY_ENUM = {"food", "travel", "hobby", "fitness", "shopping", "culture", "educational", "misc"}
 PRICE_ENUM = {"cheap", "mid", "expensive", "unknown"}
 
 EXTRACT_SYSTEM = """you extract structured facts from a saved instagram reel (its caption + transcript). return one json object and nothing else.
 
 fields:
-- category: one of ["food","travel","hobby","fitness","shopping","culture","misc"]. pick the closest. no other values.
-- venue_name: the specific place (restaurant, cafe, hotel, shop, gym, spot). null if not clearly named.
+- category: one of ["food","travel","hobby","fitness","shopping","culture","educational","misc"]. pick the closest. no other values. use "educational" for how-to / explainer / tips / learning content (tutorials, finance tips, coding, study advice, etc.).
+- venue_name: the specific place (restaurant, cafe, hotel, shop, gym, spot). null if not clearly named. for educational content there is usually no venue — leave it null.
 - area: the neighbourhood as locals say it (e.g. "Koramangala", "Richmond Town"). not a full postal address. null if unknown.
 - city: null if unknown.
 - country: null if unknown.
-- subtype: cuisine for food (e.g. "kebabs and rolls"), activity type for travel/hobby. null if unclear.
+- subtype: cuisine for food (e.g. "kebabs and rolls"), activity type for travel/hobby, or the topic for educational (e.g. "personal finance", "python"). null if unclear.
 - price_hint: one of ["cheap","mid","expensive","unknown"].
-- highlights: array of short strings — the things actually worth knowing (dish + rating, wait time, price, the standout detail). [] if none.
+- highlights: array of short strings — the things actually worth knowing (dish + rating, wait time, price, or for educational the key takeaway / what it teaches). [] if none.
 
 rules:
 - null discipline is critical. if a venue is not clearly identifiable, venue_name is null. NEVER guess or write "a local restaurant" / "a cafe" / "unknown venue". a made-up name is worse than null.

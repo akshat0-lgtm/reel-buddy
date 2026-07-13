@@ -1,7 +1,13 @@
 # Reel Buddy — Handover for Claude Code
 
 Read this fully before changing anything. It contains hard-won context that is
-NOT obvious from the code, plus three scoped tasks.
+NOT obvious from the code.
+
+> **Status (2026-07-13): Tasks A, B and C are all SHIPPED and deployed.**
+> This doc has been updated to describe the system *as it now is*. The original
+> task specs are preserved at the bottom under **"Original task specs"** as a
+> record of what was built and why — read them for design rationale, not as a
+> to-do list.
 
 ---
 
@@ -22,12 +28,16 @@ DM arrives ──► poller (30s) ──► is it a reel?
                    YES                        NO (plain text)
                     │                          │
        download video (CDN)          embed question
-       ffmpeg → mp3                  vector search (match_reels RPC)
-       Groq Whisper → transcript     top-K reels → Groq Llama
-       embed(caption + transcript)   short answer
-       INSERT into reels             │
-       reply "Saved ✅"              reply with answer
+       ffmpeg → mp3                  vector search (match_reels RPC),
+       Groq Whisper → transcript     HARD-scoped to sender's owner_ig_id
+       Groq extract → JSON fields    top-K reels → Groq Llama
+       embed(DISTILLED fields only)  short answer (lowercase, bullets)
+       INSERT into reels (+owner)    │
+       reply "got it" / "noted"      reply with answer
 ```
+
+Everything is per-user: a reel is owned by whoever sent it (`owner_ig_id`), and
+every query is scoped to the asker. See §3 and §4g.
 
 ## 2. File map
 
@@ -42,30 +52,46 @@ DM arrives ──► poller (30s) ──► is it a reel?
 | `schema.sql` | Supabase schema (run manually in SQL Editor) |
 | `setup_session.py` | Run locally to mint an IG session. See §4. |
 
-## 3. Current data model — READ THIS, IT DRIVES TASK B
+## 3. Current data model — READ THIS
 
 ```sql
 reels (
-  id bigserial, media_pk text unique, code text, author text,
+  id bigserial,
+  owner_ig_id text,                    -- IG id of the sender; per-user isolation (§4g)
+  media_pk text, code text, author text,
   caption text, transcript text, video_url text,
-  shared_at timestamptz, embedding vector(384)
+  shared_at timestamptz,
+  -- structured extraction, filled ONCE at ingest (never re-derived at query time):
+  category text,                       -- food|travel|hobby|fitness|shopping|culture|educational|misc
+  venue_name text, area text, city text, country text,
+  subtype text, price_hint text,
+  highlights jsonb,                    -- ["chic jumbo roll 9/10", "20 min wait"]
+  extracted jsonb,                     -- full raw extraction, for backfilling new fields
+  embedding vector(384)                -- built from DISTILLED fields, NOT the raw blob
 )
+-- uniqueness is (owner_ig_id, media_pk), NOT media_pk alone (two people may save the same reel)
 processed_messages (message_id text primary key, processed_at timestamptz)
 ```
 
-**There is NO structured extraction anywhere in this codebase.** No category, no
-location, no venue name, no cuisine. `caption` and `transcript` are stored as raw
-text, concatenated, and embedded as one blob.
+Key design points (were Tasks B & C — see "Original task specs" below for full rationale):
 
-When the bot answers "Siddiqui Kebab Centre in Richmond Town, 9/10, 20 min wait",
-it is **not** reading columns. The LLM is re-deriving those facts from the raw
-transcript at query time, on every single query, and persisting nothing.
-
-Consequences, which Task B fixes:
-- Pure semantic search. A reel that never *says* "Koramangala" is unfindable by
-  a Koramangala query even if it's physically there.
-- Cannot filter, facet, count, or browse ("show me all my travel reels" is impossible).
-- The LLM re-does the same extraction work on every query — wasteful and inconsistent.
+- **Structured extraction happens once, at ingest** (`ingest.extract_metadata`),
+  not on every query. `caption`/`transcript` are still stored raw; the LLM gets
+  them as context only for the top-K matches. Null discipline is strict — an
+  unidentifiable venue is `null`, never a guessed name (a hallucinated name
+  poisons the embedding permanently).
+- **The embedding is DISTILLED** (`rag.distilled_text`): built only from the
+  extracted fields, e.g. `"food | Siddiqui Kebab Centre | Richmond Town,
+  Bengaluru, India | kebabs and rolls | chic jumbo roll 9/10, ~20 min wait"`.
+  Sharp and junk-free, so venue/area/category are semantically searchable. If
+  extraction yields nothing, it falls back to caption+transcript so the reel is
+  still retrievable.
+- **Retrieval is pure vector search — NO relevance filters** (no category/area/
+  city gating; neighbourhood names are too fuzzy — see Task B4 below). The extracted
+  columns build the embedding and enable future browse/facet features; they do
+  NOT gate retrieval. The **one** exact filter is `owner_ig_id` (§4g).
+- Existing rows were backfilled with `backfill.py` (re-extract + re-embed from
+  stored text, no re-download). Keep it around for future field additions.
 
 ## 4. Landmines — things that WILL bite you
 
@@ -86,7 +112,12 @@ keep polling gentle and avoid bulk-dumping reels.
 crashes mid-processing must not be retried forever in a reply loop. Cost: a
 failed message is permanently marked done. **When debugging ingestion you must
 `delete from processed_messages;` in Supabase between attempts, or nothing will
-re-trigger.**
+re-trigger.** Note this is a *global* wipe (re-walks everyone's recent inbox), so
+only do it when deliberately re-testing — not as a habit. `processed_messages` is
+keyed by DM `message_id`, not by reel: a *new* DM (even the same reel, even from
+another person) always has a fresh id and triggers normally without any delete.
+To fully re-ingest one of your *own* already-saved reels you must also delete its
+`reels` row, or `reel_exists` short-circuits to "already got that one saved".
 
 **d) Instagram auth is fragile.** Login is via a `sessionid` cookie exported from a
 real browser (`IG_SESSION_B64`), NOT username/password. Password login via
@@ -103,20 +134,42 @@ actually use.
 personal scale. Keep `delay_range`, keep the 30s+jitter poll, don't add
 concurrency.
 
+**g) Access control is Instagram's accept-request flow, NOT a whitelist.** The old
+`ALLOWED_USERNAMES` whitelist was removed. The bot only reads its **primary
+inbox** (`direct_threads`); it never fetches message *requests* (the pending
+inbox). So a stranger's DM is invisible until the bot account **manually accepts**
+their request — accepting = authorizing. To add a friend: accept their request.
+To remove one: delete/block the thread (and optionally
+`delete from reels where owner_ig_id = '<their id>'`). Consequence: the *only*
+thing gating access is who you've accepted, so be deliberate — there is no
+code-level backstop, and there is no per-user rate limiting (shared Groq quota).
+
+**h) `owner_ig_id` is a hard security boundary.** Every save and every search is
+scoped to `str(msg.user_id)` (the sender). `match_reels` requires `filter_owner`
+and matches nothing if it's null (fail-closed — a missing id can never leak
+everyone's reels). Never loosen this to a fuzzy match; a leak here surfaces one
+friend's reels in another's answers. This is the one exact filter retrieval is
+allowed (contrast Task B4 below — category/area filters are deliberately NOT used).
+
 ## 5. Env vars
 
-`IG_USERNAME`, `IG_SESSION_B64`, `ALLOWED_USERNAMES` (comma-separated whitelist),
-`GROQ_API_KEY`, `SUPABASE_URL`, `SUPABASE_KEY` (service_role), plus optional
-`POLL_INTERVAL_SECONDS`, `TOP_K`, `LLM_MODEL`, `WHISPER_MODEL`.
+`IG_USERNAME`, `IG_SESSION_B64`, `GROQ_API_KEY`, `SUPABASE_URL`,
+`SUPABASE_KEY` (service_role), plus optional `POLL_INTERVAL_SECONDS`, `TOP_K`,
+`LLM_MODEL`, `WHISPER_MODEL`. (`ALLOWED_USERNAMES` is gone — see §4g. If it's
+still set on Render it is simply ignored; safe to delete.)
 
 Deploy = `git push` (Render auto-deploys). Schema changes = paste SQL manually
 into the Supabase SQL Editor.
 
 ---
 
-# TASKS
+# Original task specs (ALL SHIPPED — kept for design rationale)
 
-## TASK A — Persona and output format (easy, do first)
+> These three tasks are **done and deployed**. Kept verbatim below because they
+> explain *why* the system is shaped the way it is (null discipline, distilled
+> embeddings, no relevance filters, owner scoping). Treat as rationale, not TODO.
+
+## TASK A — Persona and output format ✅ SHIPPED (was: easy, do first)
 
 All in `rag.py` (`SYSTEM_PROMPT`, `answer_question`) and `main.py` (`handle_reel`).
 
@@ -135,7 +188,7 @@ Requirements:
 
 Note DMs render plain text — no markdown. Use `-` or `•` for bullets, never `**`.
 
-## TASK B — Structured extraction at ingest (the important one)
+## TASK B — Structured extraction at ingest ✅ SHIPPED (was: the important one)
 
 **Goal:** stop re-deriving facts at query time. Extract once, at ingest, into real
 columns. Enables filtering, faceting, and hybrid retrieval.
@@ -236,7 +289,7 @@ Existing rows have null extraction. Write a one-off script (`backfill.py`) that
 re-runs extraction over stored `caption` + `transcript` (no re-download or
 re-transcription needed — that text is already in the DB) and updates the rows.
 
-## TASK C — Multi-user
+## TASK C — Multi-user ✅ SHIPPED (whitelist since removed — see §4g)
 
 Today the whitelist (`ALLOWED_USERNAMES`) gates access, but **all reels land in
 one shared pool**. Any allowed user's question searches everyone's reels.

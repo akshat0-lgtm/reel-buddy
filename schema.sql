@@ -14,7 +14,7 @@ create table if not exists reels (
     video_url   text,
     shared_at   timestamptz default now(),
     -- structured extraction (Task B): filled once at ingest, never re-derived at query time
-    category    text,                        -- food | travel | hobby | fitness | shopping | culture | misc
+    category    text,                        -- food | travel | hobby | fitness | shopping | culture | educational | misc
     venue_name  text,                        -- the specific place, or null
     area        text,                        -- neighbourhood: "Koramangala", "Richmond Town"
     city        text,
