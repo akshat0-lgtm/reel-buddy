@@ -62,18 +62,6 @@ def build_client() -> Client:
     return cl
 
 
-def resolve_allowed_user_ids(cl: Client) -> set[int]:
-    """Turn ALLOWED_USERNAMES into Instagram user IDs once at startup."""
-    ids = set()
-    for username in config.ALLOWED_USERNAMES:
-        try:
-            ids.add(int(cl.user_id_from_username(username)))
-            log.info("Allowed user: %s", username)
-        except Exception as e:
-            log.error("Could not resolve username %s: %s", username, e)
-    return ids
-
-
 def fetch_recent_messages(cl: Client, thread_amount: int = 5, msg_amount: int = 10):
     """
     Yields (thread_id, message) tuples for recent messages across recent threads,

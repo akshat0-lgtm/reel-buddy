@@ -42,8 +42,15 @@ def mark_processed(message_id: str):
 
 # ---------- reels ----------
 
-def reel_exists(media_pk: str) -> bool:
-    res = sb.table("reels").select("id").eq("media_pk", media_pk).execute()
+def reel_exists(media_pk: str, owner_ig_id: str) -> bool:
+    """Per-owner dedupe: two different people may each save the same reel."""
+    res = (
+        sb.table("reels")
+        .select("id")
+        .eq("media_pk", media_pk)
+        .eq("owner_ig_id", owner_ig_id)
+        .execute()
+    )
     return len(res.data) > 0
 
 
@@ -92,10 +99,11 @@ def _reel_columns(meta: dict) -> dict:
     }
 
 
-def save_reel(reel: dict, transcript: str, meta: dict = None):
+def save_reel(reel: dict, transcript: str, meta: dict = None, owner_ig_id: str = None):
     """reel dict comes from instagram_client.extract_reel()"""
     meta = meta or {}
     row = {
+        "owner_ig_id": owner_ig_id,
         "media_pk": reel["media_pk"],
         "code": reel["code"],
         "author": reel["author"],
@@ -116,10 +124,16 @@ def update_extraction(reel_id: int, caption: str, transcript: str, meta: dict):
     sb.table("reels").update(row).eq("id", reel_id).execute()
 
 
-def search_reels(query: str, top_k: int = None) -> list[dict]:
+def search_reels(query: str, owner_ig_id: str, top_k: int = None) -> list[dict]:
+    """
+    Vector search HARD-SCOPED to one owner. owner_ig_id is a security boundary,
+    not a relevance filter — a leak here surfaces one person's reels in another's
+    answers. This is the one exact filter the retrieval path is allowed (see B4).
+    """
     res = sb.rpc("match_reels", {
         "query_embedding": embed(query),
         "match_count": top_k or config.TOP_K,
+        "filter_owner": owner_ig_id,
     }).execute()
     return res.data or []
 
@@ -165,8 +179,8 @@ def _context_block(m: dict) -> str:
     return "\n".join(lines)
 
 
-def answer_question(question: str) -> str:
-    matches = search_reels(question)
+def answer_question(question: str, owner_ig_id: str) -> str:
+    matches = search_reels(question, owner_ig_id)
     if not matches:
         return "nothing saved yet. send me a few reels first."
 

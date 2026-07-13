@@ -5,7 +5,8 @@ create extension if not exists vector;
 -- Every saved reel
 create table if not exists reels (
     id          bigserial primary key,
-    media_pk    text unique not null,        -- Instagram's internal media ID (dedupe key)
+    owner_ig_id text,                        -- IG user id of the person who saved it (per-user isolation)
+    media_pk    text not null,               -- Instagram's internal media ID (dedupe key, per owner)
     code        text,                        -- shortcode -> instagram.com/reel/<code>
     author      text,
     caption     text,
@@ -27,6 +28,11 @@ create table if not exists reels (
 
 create index if not exists reels_area_idx     on reels (lower(area));
 create index if not exists reels_category_idx on reels (category);
+create index if not exists reels_owner_idx    on reels (owner_ig_id);
+
+-- Two different people must be able to save the same reel, so uniqueness is
+-- (owner, media_pk), not media_pk alone.
+create unique index if not exists reels_owner_media_idx on reels (owner_ig_id, media_pk);
 
 -- DM messages we've already handled (prevents double replies after restarts)
 create table if not exists processed_messages (
@@ -38,9 +44,11 @@ create table if not exists processed_messages (
 -- Returns the structured columns too so the LLM can name places without
 -- re-deriving them from the transcript (Task B).
 drop function if exists match_reels(vector(384), int);
+drop function if exists match_reels(vector(384), int, text);
 create or replace function match_reels(
     query_embedding vector(384),
-    match_count int default 5
+    match_count int default 5,
+    filter_owner text default null
 )
 returns table (
     id bigint,
@@ -66,6 +74,9 @@ as $$
         1 - (embedding <=> query_embedding) as similarity
     from reels
     where embedding is not null
+      -- Hard owner scope. If filter_owner is null we intentionally match nothing,
+      -- so a missing owner id can never fall through to everyone's reels.
+      and owner_ig_id = filter_owner
     order by embedding <=> query_embedding
     limit match_count;
 $$;

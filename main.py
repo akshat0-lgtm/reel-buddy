@@ -3,7 +3,7 @@ Reel Buddy — main loop.
 
 Every POLL_INTERVAL_SECONDS:
   1. Fetch recent DM threads.
-  2. For each unseen message from an allowed user:
+  2. For each unseen message in an accepted DM thread:
      - shared reel  -> download, transcribe, embed, store, confirm
      - text message -> RAG over saved reels, reply with answer
 
@@ -52,8 +52,8 @@ def start_health_server():
 _CONFIRMATIONS = ["got it", "noted", "saved that one", "cool, saved", "on it, saved"]
 
 
-def handle_reel(cl, thread_id: str, reel: dict):
-    if rag.reel_exists(reel["media_pk"]):
+def handle_reel(cl, thread_id: str, reel: dict, owner_id: str):
+    if rag.reel_exists(reel["media_pk"], owner_id):
         ig.reply(cl, thread_id, "already got that one saved")
         return
 
@@ -64,7 +64,7 @@ def handle_reel(cl, thread_id: str, reel: dict):
         video_path.unlink(missing_ok=True)
 
     meta = ingest.extract_metadata(reel["caption"], transcript)
-    rag.save_reel(reel, transcript, meta)
+    rag.save_reel(reel, transcript, meta, owner_id)
 
     ack = random.choice(_CONFIRMATIONS)
     if transcript:
@@ -73,31 +73,35 @@ def handle_reel(cl, thread_id: str, reel: dict):
         ig.reply(cl, thread_id, f"{ack} — no speech on it, saved the caption.")
 
 
-def handle_text(cl, thread_id: str, text: str):
-    answer = rag.answer_question(text)
+def handle_text(cl, thread_id: str, text: str, owner_id: str):
+    answer = rag.answer_question(text, owner_id)
     ig.reply(cl, thread_id, answer)
 
 
-def process_message(cl, thread_id: str, msg, own_id: int, allowed_ids: set):
+def process_message(cl, thread_id: str, msg, own_id: int):
+    # Access control is handled by Instagram itself: the bot only reads its
+    # primary inbox (direct_threads), never message requests. A stranger's DM
+    # sits in requests, invisible, until the bot account manually accepts it.
+    # So "accepted thread" == "authorized user" — no username whitelist needed.
     if int(msg.user_id) == own_id:
         return  # bot's own messages
     if rag.is_processed(msg.id):
-        return
-    if allowed_ids and int(msg.user_id) not in allowed_ids:
-        rag.mark_processed(msg.id)  # silently ignore strangers
         return
 
     # Mark first so a crashing message can't cause an infinite reply loop
     rag.mark_processed(msg.id)
 
+    # The sender is the owner of this data. Every save + query is scoped to this id.
+    owner_id = str(msg.user_id)
+
     try:
         reel = ig.extract_reel(cl, msg)
         if reel:
-            log.info("Ingesting reel %s", reel["code"])
-            handle_reel(cl, thread_id, reel)
+            log.info("Ingesting reel %s for owner %s", reel["code"], owner_id)
+            handle_reel(cl, thread_id, reel, owner_id)
         elif msg.item_type == "text" and msg.text and msg.text.strip():
-            log.info("Answering question: %s", msg.text[:80])
-            handle_text(cl, thread_id, msg.text.strip())
+            log.info("Answering question from owner %s: %s", owner_id, msg.text[:80])
+            handle_text(cl, thread_id, msg.text.strip(), owner_id)
         # anything else (likes, stickers, image posts) is ignored
     except Exception as e:
         log.exception("Failed on message %s", msg.id)
@@ -114,17 +118,17 @@ def main():
 
     cl = ig.build_client()
     own_id = int(cl.user_id)
-    allowed_ids = ig.resolve_allowed_user_ids(cl)
-    if not allowed_ids:
-        log.warning("ALLOWED_USERNAMES empty — bot will respond to ANYONE who DMs it")
 
-    log.info("Polling every %ss. Reel Buddy is live.", config.POLL_INTERVAL_SECONDS)
+    log.info(
+        "Polling every %ss. Access = whoever the bot account has accepted in DMs.",
+        config.POLL_INTERVAL_SECONDS,
+    )
 
     consecutive_errors = 0
     while True:
         try:
             for thread_id, msg in ig.fetch_recent_messages(cl):
-                process_message(cl, thread_id, msg, own_id, allowed_ids)
+                process_message(cl, thread_id, msg, own_id)
             consecutive_errors = 0
         except Exception as e:
             consecutive_errors += 1

@@ -9,11 +9,9 @@ IG_USERNAME = os.environ["IG_USERNAME"]
 IG_PASSWORD = os.environ.get("IG_PASSWORD", "")          # fallback only; session preferred
 IG_SESSION_B64 = os.environ.get("IG_SESSION_B64", "")    # base64 of session.json (from setup_session.py)
 
-# Only these Instagram usernames can talk to the bot (comma-separated).
-# Empty = anyone who DMs the account can use it (not recommended).
-ALLOWED_USERNAMES = [
-    u.strip().lower() for u in os.environ.get("ALLOWED_USERNAMES", "").split(",") if u.strip()
-]
+# Access control is enforced by Instagram itself: the bot only reads its primary
+# inbox, never message requests. Accepting someone's DM request = authorizing them.
+# There is no username whitelist.
 
 # --- Groq (transcription + answers) ---
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
