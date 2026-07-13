@@ -44,6 +44,21 @@ def mark_processed(message_id: str):
 
 # ---------- reels ----------
 
+def all_owner_ids() -> set[str]:
+    """Distinct owner_ig_id across all reels — seeds the Task 3 user cap at startup.
+    Read-only; paginated because PostgREST caps rows returned per request."""
+    owners: set[str] = set()
+    step, start = 1000, 0
+    while True:
+        res = sb.table("reels").select("owner_ig_id").range(start, start + step - 1).execute()
+        rows = res.data or []
+        owners.update(r["owner_ig_id"] for r in rows if r.get("owner_ig_id"))
+        if len(rows) < step:
+            break
+        start += step
+    return owners
+
+
 def reel_exists(media_pk: str, owner_ig_id: str) -> bool:
     """Per-owner dedupe: two different people may each save the same reel."""
     res = (

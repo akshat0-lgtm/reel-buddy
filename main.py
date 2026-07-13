@@ -106,6 +106,34 @@ def handle_text(cl, thread_id: str, text: str, owner_id: str):
     _reply(cl, thread_id, answer)
 
 
+# ---------- hard user cap (Task 3) ----------
+# Known owners are tracked in-memory, seeded from the DB at startup. A brand-new
+# owner is onboarded only if we're under USER_CAP; otherwise they get a capacity
+# reply instead of being silently added. Existing owners always pass.
+USER_CAP = 75
+_users_lock = threading.Lock()
+_known_owners: set[str] = set()
+
+
+def _seed_known_owners():
+    owners = rag.all_owner_ids()
+    with _users_lock:
+        _known_owners.update(owners)
+    log.info("User cap: %d/%d owners known at startup", len(owners), USER_CAP)
+
+
+def _at_capacity_for(owner_id: str) -> bool:
+    """True if owner_id is new AND we're already at USER_CAP. A new owner under the
+    cap is onboarded here (added to the known set); one over the cap is not."""
+    with _users_lock:
+        if owner_id in _known_owners:
+            return False
+        if len(_known_owners) >= USER_CAP:
+            return True
+        _known_owners.add(owner_id)
+        return False
+
+
 # ---------- per-user soft rate limit (Task 2) ----------
 # In-memory sliding window: owner_ig_id -> [action timestamps]. Resets on process
 # restart (fail-open), which is acceptable at this scale. Guarded by a lock because
@@ -155,6 +183,12 @@ def process_message(cl, thread_id: str, msg, own_id: int):
         if not reel and not text:
             return  # like/sticker/image post — not an action, ignore
 
+        # Hard user cap (Task 3): a new user beyond the cap is turned away, not onboarded.
+        if _at_capacity_for(owner_id):
+            log.info("At user cap (%d) — turning away new owner %s", USER_CAP, owner_id)
+            _reply(cl, thread_id, "at capacity right now, not taking on new folks yet — try again in a bit")
+            return
+
         # Per-user soft rate limit (Task 2): only real actions count toward it.
         if _rate_limited(owner_id):
             log.info("Rate limit hit for owner %s — skipping this one", owner_id)
@@ -182,6 +216,8 @@ def main():
 
     cl = ig.build_client()
     own_id = int(cl.user_id)
+
+    _seed_known_owners()  # Task 3: prime the user-cap set from existing owners
 
     log.info(
         "Polling every %ss. Access = whoever the bot account has accepted in DMs.",
