@@ -201,12 +201,12 @@ def process_message(cl, thread_id: str, msg, own_id: int):
         else:
             log.info("Answering question from owner %s: %s", owner_id, text[:80])
             handle_text(cl, thread_id, text, owner_id)
-    except Exception as e:
-        log.exception("Failed on message %s", msg.id)
+    except Exception:
+        log.exception("Processing failed for thread %s (owner %s, msg %s)", thread_id, owner_id, msg.id)
         try:
             _reply(cl, thread_id, "ugh, that one broke on me. mind resending?")
-        except Exception:
-            pass
+        except Exception as e2:
+            log.error("Reply failed for thread %s: %s", thread_id, e2)
 
 
 # ---------- main ----------
@@ -228,10 +228,16 @@ def main():
     while True:
         cycle_start = time.monotonic()
         try:
+            # Stage: inbox fetch. Isolated so a fetch failure is logged as such,
+            # distinct from a processing or login failure (Task 4).
+            try:
+                messages = list(ig.fetch_recent_messages(cl))
+            except Exception as e:
+                log.error("Inbox fetch failed: %s", e)
+                raise
             # Gather the whole cycle first, then fan out to a bounded worker pool.
             # The `with` block only exits once every message is fully drained, so
             # cycles never overlap and the next poll waits for this one to finish.
-            messages = list(ig.fetch_recent_messages(cl))
             if messages:
                 log.info("Poll cycle: %d message(s) picked up", len(messages))
                 with ThreadPoolExecutor(max_workers=config.MAX_CONCURRENCY) as pool:
@@ -250,16 +256,17 @@ def main():
             consecutive_errors = 0
         except Exception as e:
             consecutive_errors += 1
-            log.error("Poll cycle failed (%s in a row): %s", consecutive_errors, e)
+            log.error("Poll cycle failed (%s consecutive): %s", consecutive_errors, e)
             if consecutive_errors >= 5:
-                # Probably a dead session or IG throttling — back off hard
-                log.error("Backing off 10 minutes, then re-login attempt")
+                # Probably a dead session or IG throttling — back off hard, then re-login
+                log.error("Backing off 10 minutes before a re-login attempt")
                 time.sleep(600)
                 try:
                     cl = ig.build_client()
                     consecutive_errors = 0
+                    log.info("Re-login succeeded")
                 except Exception as e2:
-                    log.error("Re-login failed: %s", e2)
+                    log.error("Login failed during re-login: %s", e2)
 
         # jitter so requests don't look robotic
         time.sleep(config.POLL_INTERVAL_SECONDS + random.uniform(0, 5))
