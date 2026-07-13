@@ -106,6 +106,30 @@ def handle_text(cl, thread_id: str, text: str, owner_id: str):
     _reply(cl, thread_id, answer)
 
 
+# ---------- per-user soft rate limit (Task 2) ----------
+# In-memory sliding window: owner_ig_id -> [action timestamps]. Resets on process
+# restart (fail-open), which is acceptable at this scale. Guarded by a lock because
+# Task 0 may process one user's burst across several workers at once.
+_RATE_LIMIT = 10          # actions (reels + questions combined) ...
+_RATE_WINDOW = 3600       # ... per this many seconds, per user
+_rate_lock = threading.Lock()
+_action_log: dict[str, list[float]] = {}
+
+
+def _rate_limited(owner_id: str) -> bool:
+    """Record an action for owner_id; return True if they're now over the limit.
+    A blocked action is deliberately NOT recorded (it shouldn't count itself)."""
+    now = time.monotonic()
+    with _rate_lock:
+        times = [t for t in _action_log.get(owner_id, []) if now - t < _RATE_WINDOW]
+        if len(times) >= _RATE_LIMIT:
+            _action_log[owner_id] = times
+            return True
+        times.append(now)
+        _action_log[owner_id] = times
+        return False
+
+
 def process_message(cl, thread_id: str, msg, own_id: int):
     # Access control is handled by Instagram itself: the bot only reads its
     # primary inbox (direct_threads), never message requests. A stranger's DM
@@ -126,13 +150,23 @@ def process_message(cl, thread_id: str, msg, own_id: int):
         # extract_reel may hit the IG API (media_info for xma shares), so serialize it
         with _ig_lock:
             reel = ig.extract_reel(cl, msg)
+
+        text = msg.text.strip() if (msg.item_type == "text" and msg.text and msg.text.strip()) else None
+        if not reel and not text:
+            return  # like/sticker/image post — not an action, ignore
+
+        # Per-user soft rate limit (Task 2): only real actions count toward it.
+        if _rate_limited(owner_id):
+            log.info("Rate limit hit for owner %s — skipping this one", owner_id)
+            _reply(cl, thread_id, "gonna need you to slow down a little, facing some traffic issues")
+            return
+
         if reel:
             log.info("Ingesting reel %s for owner %s", reel["code"], owner_id)
             handle_reel(cl, thread_id, reel, owner_id)
-        elif msg.item_type == "text" and msg.text and msg.text.strip():
-            log.info("Answering question from owner %s: %s", owner_id, msg.text[:80])
-            handle_text(cl, thread_id, msg.text.strip(), owner_id)
-        # anything else (likes, stickers, image posts) is ignored
+        else:
+            log.info("Answering question from owner %s: %s", owner_id, text[:80])
+            handle_text(cl, thread_id, text, owner_id)
     except Exception as e:
         log.exception("Failed on message %s", msg.id)
         try:
