@@ -6,6 +6,8 @@ Every POLL_INTERVAL_SECONDS:
   2. For each unseen message in an accepted DM thread:
      - shared reel  -> download, transcribe, embed, store, confirm
      - text message -> RAG over saved reels, reply with answer
+  3. Reels processed in the SAME cycle from the same thread get one combined
+     confirmation reply instead of one per reel (see _compose_reel_ack).
 
 Also runs a tiny HTTP health server so Render's free tier (plus an
 UptimeRobot ping) keeps the process alive 24/7.
@@ -79,11 +81,65 @@ _CONFIRMATIONS = [
     "cool, tucked that away",
 ]
 
+# Reel-ack batching (cheap version): a thread's outcomes within ONE poll cycle
+# are collected here instead of replied to immediately, then combined into a
+# single reply after the cycle's workers finish. This only covers messages that
+# land in the same cycle — one sent right at a poll boundary can still land in
+# the next cycle and get its own reply. That gap was an accepted tradeoff over
+# building a cross-cycle debounce, which needs a delayed-flush timer and more
+# failure modes for a marginal gain. Text answers (handle_text) are NOT batched
+# — only reel acknowledgements.
+_acks_lock = threading.Lock()
 
-def handle_reel(cl, thread_id: str, reel: dict, owner_id: str):
+
+def _record_ack(pending: dict, thread_id: str, status: str):
+    with _acks_lock:
+        pending.setdefault(thread_id, []).append(status)
+
+
+def _solo_ack(status: str) -> str:
+    """Wording for a thread that only produced one reel this cycle — identical
+    to the pre-batching behavior for the common single-reel case."""
+    if status == "duplicate":
+        return "ha, you already sent me this one"
+    ack = random.choice(_CONFIRMATIONS)
+    if status == "saved_no_audio":
+        return f"{ack} (no audio on that one, so i went off the caption)"
+    return ack
+
+
+def _compose_reel_ack(statuses: list) -> str:
+    """Combine one thread's reel outcomes from a single cycle into one reply."""
+    if len(statuses) == 1:
+        return _solo_ack(statuses[0])
+
+    n = len(statuses)
+    saved = sum(1 for s in statuses if s in ("saved", "saved_no_audio"))
+    dupes = statuses.count("duplicate")
+    no_audio = statuses.count("saved_no_audio")
+
+    if saved == 0:
+        return "ha, already got all of these"
+
+    if dupes == 0:
+        text = random.choice([
+            f"got all {n} — nice haul",
+            f"nice, saved all {n} of those",
+            f"all {n} are in",
+        ])
+    else:
+        text = f"got {saved} new ones, already had the other {dupes}"
+
+    if no_audio:
+        text += " (no audio on one or two, went off the captions)"
+    return text
+
+
+def handle_reel(cl, thread_id: str, reel: dict, owner_id: str) -> str:
+    """Runs the full ingest pipeline. Returns a status tag instead of replying
+    directly — the caller batches these per thread (see _compose_reel_ack)."""
     if rag.reel_exists(reel["media_pk"], owner_id):
-        _reply(cl, thread_id, "ha, you already sent me this one")
-        return
+        return "duplicate"
 
     video_path = ig.download_video(reel["video_url"])
     try:
@@ -94,11 +150,7 @@ def handle_reel(cl, thread_id: str, reel: dict, owner_id: str):
     meta = ingest.extract_metadata(reel["caption"], transcript)
     rag.save_reel(reel, transcript, meta, owner_id)
 
-    ack = random.choice(_CONFIRMATIONS)
-    if transcript:
-        _reply(cl, thread_id, ack)
-    else:
-        _reply(cl, thread_id, f"{ack} (no audio on that one, so i went off the caption)")
+    return "saved" if transcript else "saved_no_audio"
 
 
 def handle_text(cl, thread_id: str, text: str, owner_id: str):
@@ -158,7 +210,7 @@ def _rate_limited(owner_id: str) -> bool:
         return False
 
 
-def process_message(cl, thread_id: str, msg, own_id: int):
+def process_message(cl, thread_id: str, msg, own_id: int, pending: dict):
     # Access control is handled by Instagram itself: the bot only reads its
     # primary inbox (direct_threads), never message requests. A stranger's DM
     # sits in requests, invisible, until the bot account manually accepts it.
@@ -197,7 +249,8 @@ def process_message(cl, thread_id: str, msg, own_id: int):
 
         if reel:
             log.info("Ingesting reel %s for owner %s", reel["code"], owner_id)
-            handle_reel(cl, thread_id, reel, owner_id)
+            status = handle_reel(cl, thread_id, reel, owner_id)
+            _record_ack(pending, thread_id, status)
         else:
             log.info("Answering question from owner %s: %s", owner_id, text[:80])
             handle_text(cl, thread_id, text, owner_id)
@@ -240,15 +293,22 @@ def main():
             # cycles never overlap and the next poll waits for this one to finish.
             if messages:
                 log.info("Poll cycle: %d message(s) picked up", len(messages))
+                pending: dict = {}  # thread_id -> [reel statuses], fresh per cycle
                 with ThreadPoolExecutor(max_workers=config.MAX_CONCURRENCY) as pool:
                     futures = [
-                        pool.submit(process_message, cl, thread_id, msg, own_id)
+                        pool.submit(process_message, cl, thread_id, msg, own_id, pending)
                         for thread_id, msg in messages
                     ]
                     for f in as_completed(futures):
                         exc = f.exception()  # process_message swallows its own; guard anyway
                         if exc:
                             log.error("Worker crashed unexpectedly: %s", exc)
+
+                # Flush one combined reel-ack reply per thread, now that every
+                # worker in this cycle has finished (see _compose_reel_ack).
+                for thread_id, statuses in pending.items():
+                    _reply(cl, thread_id, _compose_reel_ack(statuses))
+
                 log.info(
                     "Poll cycle: drained %d message(s) in %.1fs",
                     len(messages), time.monotonic() - cycle_start,
