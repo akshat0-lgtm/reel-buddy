@@ -17,7 +17,11 @@ import config
 
 log = logging.getLogger("reelbuddy.ingest")
 
-groq_client = Groq(api_key=config.GROQ_API_KEY)
+# max_retries: the SDK retries 429s (and 5xx/connection errors) with exponential
+# backoff, honoring the Retry-After header. Bumped from the default 2 so a Groq
+# rate-limit spike doesn't drop a reel — messages are marked processed before
+# handling (HANDOVER §4c), so a dropped one is gone for good, not retried later.
+groq_client = Groq(api_key=config.GROQ_API_KEY, max_retries=5)
 
 CATEGORY_ENUM = {"food", "travel", "hobby", "fitness", "shopping", "culture", "educational", "misc"}
 PRICE_ENUM = {"cheap", "mid", "expensive", "unknown"}

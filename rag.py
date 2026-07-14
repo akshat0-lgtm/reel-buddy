@@ -16,7 +16,9 @@ import config
 log = logging.getLogger("reelbuddy.rag")
 
 sb = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
-groq_client = Groq(api_key=config.GROQ_API_KEY)
+# max_retries: SDK-native exponential backoff on 429/5xx, honoring Retry-After.
+# Bumped from the default 2 so a rate-limit spike retries instead of failing a query.
+groq_client = Groq(api_key=config.GROQ_API_KEY, max_retries=5)
 
 log.info("Loading embedding model (first run downloads ~130MB)...")
 _embedder = TextEmbedding(config.EMBED_MODEL)
@@ -41,6 +43,21 @@ def mark_processed(message_id: str):
 
 
 # ---------- reels ----------
+
+def all_owner_ids() -> set[str]:
+    """Distinct owner_ig_id across all reels — seeds the Task 3 user cap at startup.
+    Read-only; paginated because PostgREST caps rows returned per request."""
+    owners: set[str] = set()
+    step, start = 1000, 0
+    while True:
+        res = sb.table("reels").select("owner_ig_id").range(start, start + step - 1).execute()
+        rows = res.data or []
+        owners.update(r["owner_ig_id"] for r in rows if r.get("owner_ig_id"))
+        if len(rows) < step:
+            break
+        start += step
+    return owners
+
 
 def reel_exists(media_pk: str, owner_ig_id: str) -> bool:
     """Per-owner dedupe: two different people may each save the same reel."""

@@ -14,6 +14,7 @@ import logging
 import random
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import config
@@ -48,6 +49,26 @@ def start_health_server():
 
 # ---------- message handlers ----------
 
+# All outbound Instagram API calls (replies + the media lookups inside
+# extract_reel) run under this lock. Task 0 parallelises the slow per-message
+# pipeline (download, ffmpeg, whisper, extraction, embed, insert), but the
+# account's IG calls stay single-threaded and human-paced on purpose: concurrent
+# IG calls raise ban risk (HANDOVER §4f) and instagrapi's shared Client is not
+# guaranteed thread-safe.
+_ig_lock = threading.Lock()
+
+
+def _reply(cl, thread_id: str, text: str):
+    """Serialized Instagram reply with anti-automation jitter. Use instead of ig.reply()."""
+    # Variable pause before sending: a fixed reply delay across many threads is a
+    # stronger automation signal to Instagram than the poll timing (Task 1). Done
+    # before acquiring the lock so the waits overlap across workers rather than
+    # stacking; only the actual send is serialized.
+    time.sleep(random.uniform(1, 4))
+    with _ig_lock:
+        ig.reply(cl, thread_id, text)
+
+
 # lowercase, warm-but-dry confirmations — no emoji, no templated "Saved". see Task A.
 _CONFIRMATIONS = [
     "got it",
@@ -61,7 +82,7 @@ _CONFIRMATIONS = [
 
 def handle_reel(cl, thread_id: str, reel: dict, owner_id: str):
     if rag.reel_exists(reel["media_pk"], owner_id):
-        ig.reply(cl, thread_id, "ha, you already sent me this one")
+        _reply(cl, thread_id, "ha, you already sent me this one")
         return
 
     video_path = ig.download_video(reel["video_url"])
@@ -75,14 +96,66 @@ def handle_reel(cl, thread_id: str, reel: dict, owner_id: str):
 
     ack = random.choice(_CONFIRMATIONS)
     if transcript:
-        ig.reply(cl, thread_id, ack)
+        _reply(cl, thread_id, ack)
     else:
-        ig.reply(cl, thread_id, f"{ack} (no audio on that one, so i went off the caption)")
+        _reply(cl, thread_id, f"{ack} (no audio on that one, so i went off the caption)")
 
 
 def handle_text(cl, thread_id: str, text: str, owner_id: str):
     answer = rag.answer_question(text, owner_id)
-    ig.reply(cl, thread_id, answer)
+    _reply(cl, thread_id, answer)
+
+
+# ---------- hard user cap (Task 3) ----------
+# Known owners are tracked in-memory, seeded from the DB at startup. A brand-new
+# owner is onboarded only if we're under USER_CAP; otherwise they get a capacity
+# reply instead of being silently added. Existing owners always pass.
+USER_CAP = 75
+_users_lock = threading.Lock()
+_known_owners: set[str] = set()
+
+
+def _seed_known_owners():
+    owners = rag.all_owner_ids()
+    with _users_lock:
+        _known_owners.update(owners)
+    log.info("User cap: %d/%d owners known at startup", len(owners), USER_CAP)
+
+
+def _at_capacity_for(owner_id: str) -> bool:
+    """True if owner_id is new AND we're already at USER_CAP. A new owner under the
+    cap is onboarded here (added to the known set); one over the cap is not."""
+    with _users_lock:
+        if owner_id in _known_owners:
+            return False
+        if len(_known_owners) >= USER_CAP:
+            return True
+        _known_owners.add(owner_id)
+        return False
+
+
+# ---------- per-user soft rate limit (Task 2) ----------
+# In-memory sliding window: owner_ig_id -> [action timestamps]. Resets on process
+# restart (fail-open), which is acceptable at this scale. Guarded by a lock because
+# Task 0 may process one user's burst across several workers at once.
+_RATE_LIMIT = 10          # actions (reels + questions combined) ...
+_RATE_WINDOW = 3600       # ... per this many seconds, per user
+_rate_lock = threading.Lock()
+_action_log: dict[str, list[float]] = {}
+
+
+def _rate_limited(owner_id: str) -> bool:
+    """Record an action for owner_id; return True if they're now over the limit.
+    A blocked action is deliberately NOT recorded (it shouldn't count itself)."""
+    now = time.monotonic()
+    with _rate_lock:
+        times = [t for t in _action_log.get(owner_id, []) if now - t < _RATE_WINDOW]
+        if len(times) >= _RATE_LIMIT:
+            _action_log[owner_id] = times
+            return True
+        times.append(now)
+        _action_log[owner_id] = times
+        return False
 
 
 def process_message(cl, thread_id: str, msg, own_id: int):
@@ -102,20 +175,38 @@ def process_message(cl, thread_id: str, msg, own_id: int):
     owner_id = str(msg.user_id)
 
     try:
-        reel = ig.extract_reel(cl, msg)
+        # extract_reel may hit the IG API (media_info for xma shares), so serialize it
+        with _ig_lock:
+            reel = ig.extract_reel(cl, msg)
+
+        text = msg.text.strip() if (msg.item_type == "text" and msg.text and msg.text.strip()) else None
+        if not reel and not text:
+            return  # like/sticker/image post — not an action, ignore
+
+        # Hard user cap (Task 3): a new user beyond the cap is turned away, not onboarded.
+        if _at_capacity_for(owner_id):
+            log.info("At user cap (%d) — turning away new owner %s", USER_CAP, owner_id)
+            _reply(cl, thread_id, "at capacity right now, not taking on new folks yet — try again in a bit")
+            return
+
+        # Per-user soft rate limit (Task 2): only real actions count toward it.
+        if _rate_limited(owner_id):
+            log.info("Rate limit hit for owner %s — skipping this one", owner_id)
+            _reply(cl, thread_id, "gonna need you to slow down a little, facing some traffic issues")
+            return
+
         if reel:
             log.info("Ingesting reel %s for owner %s", reel["code"], owner_id)
             handle_reel(cl, thread_id, reel, owner_id)
-        elif msg.item_type == "text" and msg.text and msg.text.strip():
-            log.info("Answering question from owner %s: %s", owner_id, msg.text[:80])
-            handle_text(cl, thread_id, msg.text.strip(), owner_id)
-        # anything else (likes, stickers, image posts) is ignored
-    except Exception as e:
-        log.exception("Failed on message %s", msg.id)
+        else:
+            log.info("Answering question from owner %s: %s", owner_id, text[:80])
+            handle_text(cl, thread_id, text, owner_id)
+    except Exception:
+        log.exception("Processing failed for thread %s (owner %s, msg %s)", thread_id, owner_id, msg.id)
         try:
-            ig.reply(cl, thread_id, "ugh, that one broke on me. mind resending?")
-        except Exception:
-            pass
+            _reply(cl, thread_id, "ugh, that one broke on me. mind resending?")
+        except Exception as e2:
+            log.error("Reply failed for thread %s: %s", thread_id, e2)
 
 
 # ---------- main ----------
@@ -126,6 +217,8 @@ def main():
     cl = ig.build_client()
     own_id = int(cl.user_id)
 
+    _seed_known_owners()  # Task 3: prime the user-cap set from existing owners
+
     log.info(
         "Polling every %ss. Access = whoever the bot account has accepted in DMs.",
         config.POLL_INTERVAL_SECONDS,
@@ -133,22 +226,47 @@ def main():
 
     consecutive_errors = 0
     while True:
+        cycle_start = time.monotonic()
         try:
-            for thread_id, msg in ig.fetch_recent_messages(cl):
-                process_message(cl, thread_id, msg, own_id)
+            # Stage: inbox fetch. Isolated so a fetch failure is logged as such,
+            # distinct from a processing or login failure (Task 4).
+            try:
+                messages = list(ig.fetch_recent_messages(cl))
+            except Exception as e:
+                log.error("Inbox fetch failed: %s", e)
+                raise
+            # Gather the whole cycle first, then fan out to a bounded worker pool.
+            # The `with` block only exits once every message is fully drained, so
+            # cycles never overlap and the next poll waits for this one to finish.
+            if messages:
+                log.info("Poll cycle: %d message(s) picked up", len(messages))
+                with ThreadPoolExecutor(max_workers=config.MAX_CONCURRENCY) as pool:
+                    futures = [
+                        pool.submit(process_message, cl, thread_id, msg, own_id)
+                        for thread_id, msg in messages
+                    ]
+                    for f in as_completed(futures):
+                        exc = f.exception()  # process_message swallows its own; guard anyway
+                        if exc:
+                            log.error("Worker crashed unexpectedly: %s", exc)
+                log.info(
+                    "Poll cycle: drained %d message(s) in %.1fs",
+                    len(messages), time.monotonic() - cycle_start,
+                )
             consecutive_errors = 0
         except Exception as e:
             consecutive_errors += 1
-            log.error("Poll cycle failed (%s in a row): %s", consecutive_errors, e)
+            log.error("Poll cycle failed (%s consecutive): %s", consecutive_errors, e)
             if consecutive_errors >= 5:
-                # Probably a dead session or IG throttling — back off hard
-                log.error("Backing off 10 minutes, then re-login attempt")
+                # Probably a dead session or IG throttling — back off hard, then re-login
+                log.error("Backing off 10 minutes before a re-login attempt")
                 time.sleep(600)
                 try:
                     cl = ig.build_client()
                     consecutive_errors = 0
+                    log.info("Re-login succeeded")
                 except Exception as e2:
-                    log.error("Re-login failed: %s", e2)
+                    log.error("Login failed during re-login: %s", e2)
 
         # jitter so requests don't look robotic
         time.sleep(config.POLL_INTERVAL_SECONDS + random.uniform(0, 5))
