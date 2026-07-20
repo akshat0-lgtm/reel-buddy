@@ -6,6 +6,7 @@ fastembed over sentence-transformers because it's ONNX-based — no torch,
 fits comfortably in a 512MB free-tier container.
 """
 import logging
+import random
 
 from fastembed import TextEmbedding
 from groq import Groq
@@ -57,6 +58,13 @@ def all_owner_ids() -> set[str]:
             break
         start += step
     return owners
+
+
+def owner_has_reels(owner_ig_id: str) -> bool:
+    """Does this user have any saved reels at all? Lets us greet a user with an
+    empty stash differently from one whose query simply didn't match anything."""
+    res = sb.table("reels").select("id").eq("owner_ig_id", owner_ig_id).limit(1).execute()
+    return len(res.data) > 0
 
 
 def reel_exists(media_pk: str, owner_ig_id: str) -> bool:
@@ -152,7 +160,12 @@ def search_reels(query: str, owner_ig_id: str, top_k: int = None) -> list[dict]:
         "match_count": top_k or config.TOP_K,
         "filter_owner": owner_ig_id,
     }).execute()
-    return res.data or []
+    matches = res.data or []
+    # Still SELECT the top-K by relevance (the RPC orders by cosine distance),
+    # but PRESENT them most-recently-saved first. id is bigserial assigned at
+    # insert, so id-desc == save-time order — no shared_at column needed.
+    matches.sort(key=lambda m: m.get("id", 0), reverse=True)
+    return matches
 
 
 # ---------- answer generation ----------
@@ -176,6 +189,7 @@ format:
 - this is a plain-text dm: no markdown, no asterisks, no headers.
 - name the place or describe the resource. never paste reel links or shortcodes.
 - keep each bullet tight: the place/resource, then the one thing worth knowing (dish, rating, wait, price, or what the reel teaches).
+- the reels are given to you most-recently-saved first. list your picks in that same order — newest at the top.
 
 grounding:
 - only surface things that appear in the context. never invent a place, a resource, or a detail.
@@ -203,9 +217,22 @@ def _context_block(m: dict) -> str:
     return "\n".join(lines)
 
 
+# Casual onboarding nudge for a user who hasn't saved anything yet — distinct
+# from the "nothing matched that query" reply below. Same lowercase, no-hype voice.
+_EMPTY_STASH_INTROS = [
+    "hey — i'm your reel curator. send me a few reels (food, travel, how-tos, whatever) and i'll remember them, then just ask me about them anytime",
+    "hey, nothing saved yet. share me some reels and i'll keep track — then ask me anything and i'll pull the right ones back up",
+    "hi — think of me as a memory for your reels. send a few over and i'll surface the right one whenever you ask",
+]
+
+
 def answer_question(question: str, owner_ig_id: str) -> str:
     matches = search_reels(question, owner_ig_id)
     if not matches:
+        # Empty stash -> friendly nudge to start sharing; otherwise the query
+        # just didn't match anything they've saved.
+        if not owner_has_reels(owner_ig_id):
+            return random.choice(_EMPTY_STASH_INTROS)
         return "hmm, nothing in your stash on that yet — send me a few reels and i'll remember them"
 
     context = "\n\n---\n\n".join(_context_block(m) for m in matches)
